@@ -1,0 +1,12 @@
+# Core training and inference
+torch>=2.1
+opencv-python>=4.8
+numpy>=1.24
+matplotlib>=3.7
+
+# Development and tests
+pytest>=7.0
+
+# LiteRT/TFLite export
+litert-torch
+ai-edge-litert
