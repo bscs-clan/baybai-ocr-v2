@@ -49,7 +49,10 @@ def main():
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         edge_model.export(str(output))
+        vocabulary_path = output.with_suffix(".vocab.json")
+        vocab.save(vocabulary_path)
     print(f"Exported: {output.resolve()} ({output.stat().st_size / (1024 * 1024):.2f} MiB)")
+    print(f"Exported vocabulary: {vocabulary_path.resolve()}")
     print("Conversion/export success is not a mobile latency guarantee; benchmark the exported artifact on target phones.")
     if not close:
         raise SystemExit("Converted output failed numerical smoke check; do not deploy without investigating.")

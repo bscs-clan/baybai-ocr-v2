@@ -1,6 +1,6 @@
 # Baybayin OCR
 
-Mobile-oriented Baybayin text-line OCR using PyTorch, a compact CNN/TCN, and CTC loss.
+Baybayin text-line OCR using PyTorch, a compact CNN/TCN, and CTC loss.
 
 ## Setup
 
@@ -120,3 +120,4 @@ Default input shape is `(B, 1, 48, 320)`. Images are grayscale, fit to a white c
 
 ## License
 
+This project is licensed under the terms described in the [LICENSE](./LICENSE) file.

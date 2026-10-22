@@ -18,6 +18,7 @@ MARK_RANK = {
     "TAGALOG SIGN VIRAMA": 2,
     "TAGALOG SIGN PAMUDPOD": 3,
 }
+PUNCTUATION_RANK = {",": 0, "᜵": 1, "᜶": 2, ".": 3, " ": 4}
 
 
 def _abakada_sort_key(char: str):
@@ -26,17 +27,14 @@ def _abakada_sort_key(char: str):
         syllable = name.removeprefix("TAGALOG LETTER ")
         if syllable in ABAKADA_RANK:
             return (0, ABAKADA_RANK[syllable], name)
+    if char in PUNCTUATION_RANK:
+        return (1, PUNCTUATION_RANK[char], name)
     if name in MARK_RANK:
-        return (1, MARK_RANK[name], name)
-    if char == "᜵":  # Baybayin single punctuation, comma-like
-        return (2, 0, name)
-    if char == "᜶":  # Baybayin double punctuation, period-like
-        return (2, 1, name)
-    if char in {",", "."}:
-        return (2, 2 if char == "," else 3, name)
-    # Keep any additional Tagalog marks with the other signs, before punctuation.
+        return (2, MARK_RANK[name], name)
+    # Keep any additional Tagalog marks with the other signs, after the common
+    # punctuation and space entries.
     if name.startswith("TAGALOG "):
-        return (1, 4, name)
+        return (2, 4, name)
     if "PUNCTUATION" in name:
         return (2, 4, name)
     return (3, name or char)
@@ -73,8 +71,9 @@ def character_confusion_matrix(references: Sequence[str], hypotheses: Sequence[s
 
     Rows are reference characters and columns are predicted characters.
     Insertions use a dedicated row; deletions use a dedicated column. Character
-    labels are ordered by Filipino Abakada order. Inserted and deleted slots
-    follow the character labels.
+    labels are ordered by Filipino Abakada order, then comma, Baybayin
+    punctuation, period, space, and combining marks. Inserted and deleted
+    slots follow the character labels.
     """
     ordered_characters = sorted(set(characters), key=_abakada_sort_key)
     labels = ordered_characters + [INSERTION_LABEL, DELETION_LABEL]

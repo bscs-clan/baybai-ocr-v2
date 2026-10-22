@@ -4,6 +4,12 @@ import json
 import time
 from pathlib import Path
 
+_BAYBAYIN_MARK_LABELS = {
+    "᜔": "virama (+)",  # U+1714
+    "ᜓ": "bottom (•)",  # U+1713
+    "ᜒ": "top (•)",     # U+1712
+}
+
 
 def _configure_fonts(matplotlib):
     """Load the bundled Philippine script font and return its glyph coverage."""
@@ -12,19 +18,17 @@ def _configure_fonts(matplotlib):
     tagalog_font = Path(__file__).resolve().parents[2] / "fonts" / "Noto_Sans_Tagalog" / "NotoSansTagalog-Regular.ttf"
     if tagalog_font.is_file():
         font_manager.fontManager.addfont(str(tagalog_font))
-        tagalog_family = font_manager.FontProperties(fname=str(tagalog_font)).get_name()
     else:
         try:
             tagalog_font = Path(font_manager.findfont("Noto Sans Tagalog", fallback_to_default=False))
-            tagalog_family = "Noto Sans Tagalog"
         except ValueError:
             tagalog_font = None
-            tagalog_family = None
+    # Use a full Latin font for graph text and numeric axes. Apply Tagalog only
+    # to Baybayin tick labels below, since the script font has limited Latin coverage.
+    matplotlib.rcParams["font.family"] = ["DejaVu Sans"]
     if tagalog_font:
-        matplotlib.rcParams["font.family"] = [tagalog_family, "DejaVu Sans"]
         tagalog_coverage = set(font_manager.get_font(str(tagalog_font)).get_charmap())
     else:
-        matplotlib.rcParams["font.family"] = ["DejaVu Sans"]
         tagalog_coverage = set()
     fallback_font = font_manager.findfont("DejaVu Sans", fallback_to_default=True)
     fallback_coverage = set(font_manager.get_font(fallback_font).get_charmap())
@@ -34,15 +38,41 @@ def _configure_fonts(matplotlib):
 def _matrix_tick_labels(labels, glyph_coverage):
     display_labels = []
     for label in labels:
-        if label == "<inserted>":
+        if label == " ":
+            display_labels.append("space")
+        elif label == "<inserted>":
             display_labels.append("inserted")
         elif label == "<deleted>":
             display_labels.append("deleted")
+        elif label in _BAYBAYIN_MARK_LABELS:
+            display_labels.append(_BAYBAYIN_MARK_LABELS[label])
         elif ord(label) in glyph_coverage:
             display_labels.append(label)
         else:
             display_labels.append(f"U+{ord(label):04X}")
     return display_labels
+
+
+def _set_matrix_ticks(axis, labels, glyph_coverage):
+    from matplotlib import font_manager
+
+    display_labels = _matrix_tick_labels(labels, glyph_coverage)
+    axis.set_xticks(range(len(labels)), labels=display_labels, rotation=90, fontsize=8)
+    axis.set_yticks(range(len(labels)), labels=display_labels, fontsize=8)
+
+    font_path = Path(__file__).resolve().parents[2] / "fonts" / "Noto_Sans_Tagalog" / "NotoSansTagalog-Regular.ttf"
+    if font_path.is_file():
+        baybayin_font = font_manager.FontProperties(fname=str(font_path))
+    else:
+        baybayin_font = font_manager.FontProperties(family="Noto Sans Tagalog")
+    for raw_label, tick in zip(labels, axis.get_xticklabels()):
+        if (raw_label not in _BAYBAYIN_MARK_LABELS and len(raw_label) == 1
+                and 0x1700 <= ord(raw_label) <= 0x1736 and ord(raw_label) in glyph_coverage):
+            tick.set_fontproperties(baybayin_font)
+    for raw_label, tick in zip(labels, axis.get_yticklabels()):
+        if (raw_label not in _BAYBAYIN_MARK_LABELS and len(raw_label) == 1
+                and 0x1700 <= ord(raw_label) <= 0x1736 and ord(raw_label) in glyph_coverage):
+            tick.set_fontproperties(baybayin_font)
 
 
 def _read_records(path: Path):
@@ -105,9 +135,7 @@ def _build_plots(records, output_dir: Path, interactive: bool):
         matrix = matrix_record["confusion_matrix"]
         labels = matrix_record["confusion_labels"]
         image = ax.imshow(matrix, interpolation="nearest", cmap="Blues", vmin=0)
-        tick_labels = _matrix_tick_labels(labels, glyph_coverage)
-        ax.set_xticks(range(len(labels)), labels=tick_labels, rotation=90, fontsize=8)
-        ax.set_yticks(range(len(labels)), labels=tick_labels, fontsize=8)
+        _set_matrix_ticks(ax, labels, glyph_coverage)
         ax.set(title=f"Validation character confusion matrix · epoch {matrix_record['epoch']}",
                xlabel="Predicted character", ylabel="Reference character")
         fig_matrix.colorbar(image, ax=ax, label="Character count")
@@ -214,9 +242,7 @@ def main():
                 labels = matrix_record["confusion_labels"]
                 matrix_image = ax_matrix.imshow(matrix, interpolation="nearest", cmap="Blues", vmin=0)
                 matrix_image.set_clim(0, max(1, max(max(row) for row in matrix)))
-                tick_labels = _matrix_tick_labels(labels, glyph_coverage)
-                ax_matrix.set_xticks(range(len(labels)), labels=tick_labels, rotation=90, fontsize=8)
-                ax_matrix.set_yticks(range(len(labels)), labels=tick_labels, fontsize=8)
+                _set_matrix_ticks(ax_matrix, labels, glyph_coverage)
                 ax_matrix.set(title=f"Validation character confusion matrix · epoch {matrix_record['epoch']}",
                               xlabel="Predicted character", ylabel="Reference character")
                 if state["matrix_colorbar"] is None:
