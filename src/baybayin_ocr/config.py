@@ -16,9 +16,9 @@ class OCRConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     grad_clip: float = 5.0
-    val_split: float = 0.15
+    val_split: float = 0.30
     num_workers: int = 0
-    patience: int = 15
+    patience: int = 4
     seed: int = 42
     device: str = "auto"
     augment: bool = True

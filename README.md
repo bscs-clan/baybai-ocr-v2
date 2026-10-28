@@ -61,6 +61,10 @@ python3 train.py --dataset dataset --epochs 60 --batch-size 64 --image-width 320
 
 Training opens a resizable live graph window. Use `--no-live-plot` to disable it. Checkpoints, metrics, and graphs are saved in `checkpoints/` by default.
 
+Training augmentation includes occasional low-light exposure reduction and
+signal-dependent/read camera noise, alongside small geometric and brightness
+changes. Disable all augmentation with `--no-augment`.
+
 Other commands:
 
 ```bash
