@@ -59,16 +59,28 @@ img_002.png<TAB>ᜊᜎᜈᜌᜒ
 python3 train.py --dataset dataset --epochs 60 --batch-size 64 --image-width 320
 ```
 
-Training opens a resizable live graph window. Use `--no-live-plot` to disable it. Checkpoints, metrics, and graphs are saved in `checkpoints/` by default.
+Training opens a resizable live graph window. Use `--no-live-plot` to disable it. Checkpoints (`epoch_<N>.pt`, `best_model.pt`, and `last_model.pt`), metrics, and graphs are saved in `checkpoints/` by default.
 
 Training augmentation includes occasional low-light exposure reduction and
 signal-dependent/read camera noise, alongside small geometric and brightness
 changes. Disable all augmentation with `--no-augment`.
 
-Other commands:
+Stop and resume training:
 
 ```bash
-python3 train.py --resume checkpoints/last_model.pt
+# Stop training gracefully:
+# 1. Click "Stop Training" in the live graph window, OR
+# 2. Press Ctrl+C in the training terminal, OR
+# 3. Run:
+python3 train.py --stop
+
+# Resume training from the latest checkpoint automatically:
+python3 train.py --resume
+
+# Or resume from a specific checkpoint:
+python3 train.py --resume checkpoints/epoch_5.pt
+
+# Test prediction:
 python3 predict.py --checkpoint checkpoints/best_model.pt --image dataset/images/img_001.png
 python3 -m pytest -q tests
 ```

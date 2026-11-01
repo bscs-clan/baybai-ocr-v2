@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from baybayin_ocr.config import OCRConfig
-from baybayin_ocr.training import train_model
+from baybayin_ocr.training import find_resume_checkpoint, train_model
 
 
 def parse_args():
@@ -21,25 +21,42 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--image-width", type=int, default=320, help="Fixed model input width; keep fixed for export")
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--learning-rate", type=float, default=5e-3)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--val-split", type=float, default=0.20)
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience; 0 disables it")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--feature-channels", type=int, default=128)
     parser.add_argument("--temporal-blocks", type=int, default=4)
     parser.add_argument("--log-every-n-batches", type=int, default=10)
     parser.add_argument("--metrics-jsonl", default=None, help="Append machine-readable training metrics as JSON Lines")
     parser.add_argument("--no-live-plot", action="store_true", help="Disable the separate live graph window")
-    parser.add_argument("--resume", default=None, help="Resume from a full training checkpoint")
+    parser.add_argument("--resume", nargs="?", const="auto", default=None,
+                        help="Resume training. Pass a checkpoint file path, or omit path to resume from the latest checkpoint in output-dir.")
+    parser.add_argument("--stop", action="store_true",
+                        help="Signal a running training process in output-dir to stop and save a checkpoint.")
     parser.add_argument("--no-augment", action="store_true", help="Disable mild camera-like training augmentation")
+    parser.add_argument("--save-every-epoch", action=argparse.BooleanOptionalAction, default=True,
+                        help="Save a model checkpoint at each epoch (e.g. epoch_1.pt)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    output_dir = Path(args.output_dir).resolve()
+    if args.stop:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stop_path = output_dir / "training.stop"
+        stop_path.write_text("stop\n", encoding="utf-8")
+        print(f"Stop signal sent to {stop_path}. The running training process will save checkpoint and exit.", flush=True)
+        return
+
+    resume_path = find_resume_checkpoint(output_dir, args.resume)
+    if resume_path:
+        print(f"Resuming training from checkpoint: {resume_path}", flush=True)
+
     config = OCRConfig(
         image_height=48,
         image_width=args.image_width,
@@ -56,12 +73,17 @@ def main():
         seed=args.seed,
         augment=not args.no_augment,
         log_every_n_batches=args.log_every_n_batches,
+        save_every_epoch=args.save_every_epoch,
     )
-    output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_jsonl).resolve() if args.metrics_jsonl else output_dir / "training_metrics.jsonl"
-    if not args.metrics_jsonl:
+    if not args.metrics_jsonl and not resume_path:
         metrics_path.write_text("", encoding="utf-8")
+    stop_path = output_dir / "training.stop"
+    try:
+        stop_path.unlink()
+    except FileNotFoundError:
+        pass
     done_path = output_dir / "training.done"
     try:
         done_path.unlink()
@@ -81,7 +103,7 @@ def main():
         print("Live training graph window starting; final PNG graphs will be saved in", output_dir, flush=True)
 
     try:
-        result = train_model(config, args.dataset, output_dir, metrics_path, args.resume)
+        result = train_model(config, args.dataset, output_dir, metrics_path, resume_path)
     finally:
         done_path.write_text("done\n", encoding="utf-8")
     print("Training result:")

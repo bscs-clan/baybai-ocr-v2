@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import signal
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -91,6 +92,34 @@ def _evaluate(model, loader, vocabulary, device, ctc_loss):
     }
 
 
+def find_resume_checkpoint(output_dir: str | Path, resume_arg: Optional[str] = "auto") -> Optional[Path]:
+    if not resume_arg:
+        return None
+    out_dir = Path(output_dir).resolve()
+    if resume_arg != "auto":
+        target = Path(resume_arg).resolve()
+        if not target.is_file():
+            raise FileNotFoundError(f"Checkpoint to resume not found: {target}")
+        return target
+    last_model = out_dir / "last_model.pt"
+    if last_model.is_file():
+        return last_model
+    epoch_files = []
+    for p in out_dir.glob("epoch_*.pt"):
+        try:
+            num = int(p.stem.split("_")[1])
+            epoch_files.append((num, p))
+        except (IndexError, ValueError):
+            pass
+    if epoch_files:
+        epoch_files.sort(key=lambda x: x[0], reverse=True)
+        return epoch_files[0][1]
+    best_model = out_dir / "best_model.pt"
+    if best_model.is_file():
+        return best_model
+    raise FileNotFoundError(f"No checkpoint found to resume from in {out_dir}. Please specify a checkpoint path or run without --resume.")
+
+
 def train_model(config: OCRConfig, dataset_root: str | Path = "dataset",
                 output_dir: str | Path = "checkpoints", metrics_jsonl: Optional[str | Path] = None,
                 resume: Optional[str | Path] = None) -> Dict[str, object]:
@@ -139,111 +168,245 @@ def train_model(config: OCRConfig, dataset_root: str | Path = "dataset",
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if hasattr(scheduler, "T_max") and scheduler.T_max != config.epochs:
+                scheduler.T_max = config.epochs
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_cer = float(checkpoint.get("best_cer", best_cer))
+        best_loss = float(checkpoint.get("best_loss", best_loss))
         global_step = int(checkpoint.get("global_step", 0))
         # Resume must use the exact label vocabulary stored with the checkpoint.
         checkpoint_vocab = checkpoint.get("vocabulary")
         if checkpoint_vocab and checkpoint_vocab != vocabulary.to_dict():
             raise ValueError("Dataset-derived vocabulary does not match checkpoint vocabulary. Do not resume with changed labels.")
+        if start_epoch > config.epochs:
+            print(f"Notice: Checkpoint has already completed epoch {start_epoch - 1} (target was {config.epochs}). "
+                  f"Increasing target epochs to {start_epoch + 10} to continue training.", flush=True)
+            config.epochs = start_epoch + 10
+            if hasattr(scheduler, "T_max"):
+                scheduler.T_max = config.epochs
+        print(f"Resumed from {resume} (resuming at epoch {start_epoch}, step {global_step}, best_CER={best_cer:.4f})", flush=True)
 
     print(f"Device: {device}; samples: {len(rows)}; train: {len(train_rows)}; val: {len(val_rows)}")
     print(f"Classes incl. CTC blank: {vocabulary.num_classes}; parameters: {model.count_parameters():,}")
     _append_jsonl(metrics_jsonl, {"kind": "start", "samples": len(rows), "train_samples": len(train_rows),
                                   "val_samples": len(val_rows), "parameters": model.count_parameters()})
 
+    stop_file = output_dir / "training.stop"
+    stop_requested = False
+
+    def _sig_handler(signum, frame):
+        nonlocal stop_requested
+        if stop_requested:
+            print("\nForce stopping immediately...", flush=True)
+            raise SystemExit(1)
+        stop_requested = True
+        sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+        print(f"\nInterrupt received ({sig_name}). Stopping gracefully after current step and saving checkpoint... (Press Ctrl+C again to force exit)", flush=True)
+
+    prev_int = None
+    prev_term = None
+    try:
+        prev_int = signal.signal(signal.SIGINT, _sig_handler)
+        prev_term = signal.signal(signal.SIGTERM, _sig_handler)
+    except (ValueError, AttributeError):
+        pass
+
     epochs_without_improvement = 0
-    for epoch in range(start_epoch, config.epochs + 1):
-        epoch_start = time.perf_counter()
-        train_dataset.set_epoch(epoch)
-        model.train()
-        running_loss = 0.0
-        running_batches = 0
-        epoch_loss_sum = 0.0
-        epoch_batches = 0
-        for batch_idx, batch in enumerate(train_loader, start=1):
-            images = batch["images"].to(device, non_blocking=True)
-            targets = batch["targets"].to(device, non_blocking=True)
-            target_lengths = batch["target_lengths"].to(device)
-            input_lengths = batch["input_lengths"].to(device)
+    stopped_early = False
+    last_record = {}
 
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            input_lengths = input_lengths.clamp(max=logits.shape[1])
-            log_probs = logits.log_softmax(-1).transpose(0, 1).contiguous()
-            loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite CTC loss at epoch={epoch}, batch={batch_idx}.")
-            loss.backward()
-            if config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            optimizer.step()
+    try:
+        for epoch in range(start_epoch, config.epochs + 1):
+            if stop_requested or stop_file.exists():
+                stopped_early = True
+                if stop_file.exists():
+                    try:
+                        stop_file.unlink()
+                    except FileNotFoundError:
+                        pass
+                print(f"Stop signal received before starting epoch {epoch}. Stopping training.", flush=True)
+                checkpoint_data = {
+                    "epoch": epoch - 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "model_config": {"feature_channels": config.feature_channels, "temporal_blocks": config.temporal_blocks,
+                                     "image_height": config.image_height, "image_width": config.image_width},
+                    "training_config": config.to_dict(),
+                    "vocabulary": vocabulary.to_dict(),
+                    "best_cer": best_cer,
+                    "best_loss": best_loss,
+                    "global_step": global_step,
+                    "metrics": last_record,
+                }
+                torch.save(checkpoint_data, output_dir / "last_model.pt")
+                print(f"Checkpoint saved to {output_dir / 'last_model.pt'}.", flush=True)
+                print(f"To resume training, run: python3 train.py --resume", flush=True)
+                break
 
-            global_step += 1
-            loss_value = float(loss.item())
-            running_loss += loss_value
-            running_batches += 1
-            epoch_loss_sum += loss_value
-            epoch_batches += 1
-            if batch_idx % max(1, config.log_every_n_batches) == 0 or batch_idx == len(train_loader):
-                _append_jsonl(metrics_jsonl, {
-                    "kind": "batch", "epoch": epoch, "batch": batch_idx,
-                    "batches_per_epoch": len(train_loader), "global_step": global_step,
-                    "train_loss": running_loss / max(1, running_batches),
-                    "epoch_progress": batch_idx / max(1, len(train_loader)),
-                })
-                print(f"Epoch {epoch}/{config.epochs} | batch {batch_idx}/{len(train_loader)} "
-                      f"| loss {running_loss / max(1, running_batches):.4f}", flush=True)
-                running_loss = 0.0
-                running_batches = 0
+            epoch_start = time.perf_counter()
+            train_dataset.set_epoch(epoch)
+            model.train()
+            running_loss = 0.0
+            running_batches = 0
+            epoch_loss_sum = 0.0
+            epoch_batches = 0
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                images = batch["images"].to(device, non_blocking=True)
+                targets = batch["targets"].to(device, non_blocking=True)
+                target_lengths = batch["target_lengths"].to(device)
+                input_lengths = batch["input_lengths"].to(device)
 
-        # Training epoch loss comes from the actual optimizer steps; avoid a second
-        # full pass over the train set just to compute a display metric.
-        train_loss = epoch_loss_sum / max(1, epoch_batches)
-        if val_loader:
-            val_metrics = _evaluate(model, val_loader, vocabulary, device, ctc_loss)
-            val_loss = val_metrics["val_loss"]
-            val_cer = val_metrics["val_cer"]
-            word_accuracy = val_metrics["word_accuracy"]
-            confusion_labels = val_metrics["confusion_labels"]
-            confusion_matrix = val_metrics["confusion_matrix"]
-            monitored = val_cer
-            improved = math.isfinite(val_cer) and val_cer < best_cer
-        else:
-            val_loss, val_cer, word_accuracy = float("nan"), float("nan"), float("nan")
-            confusion_labels, confusion_matrix = [], []
-            monitored = train_loss
-            improved = math.isfinite(train_loss) and train_loss < best_loss
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                input_lengths = input_lengths.clamp(max=logits.shape[1])
+                log_probs = logits.log_softmax(-1).transpose(0, 1).contiguous()
+                loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite CTC loss at epoch={epoch}, batch={batch_idx}.")
+                loss.backward()
+                if config.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
 
-        scheduler.step()
-        duration = time.perf_counter() - epoch_start
-        record = {
-            "kind": "epoch", "epoch": epoch, "global_step": global_step,
-            "train_loss": float(train_loss), "val_loss": float(val_loss),
-            "val_cer": float(val_cer), "word_accuracy": float(word_accuracy),
-            "confusion_labels": confusion_labels, "confusion_matrix": confusion_matrix,
-            "lr": float(optimizer.param_groups[0]["lr"]), "seconds": float(duration),
-        }
-        _append_jsonl(metrics_jsonl, record)
-        print(f"Epoch {epoch}/{config.epochs} complete | train_loss={train_loss:.4f} "
-              f"val_loss={val_loss:.4f} val_CER={val_cer:.4f} exact_accuracy={word_accuracy:.4f} "
-              f"time={duration:.1f}s", flush=True)
+                global_step += 1
+                loss_value = float(loss.item())
+                running_loss += loss_value
+                running_batches += 1
+                epoch_loss_sum += loss_value
+                epoch_batches += 1
+                if batch_idx % max(1, config.log_every_n_batches) == 0 or batch_idx == len(train_loader):
+                    _append_jsonl(metrics_jsonl, {
+                        "kind": "batch", "epoch": epoch, "batch": batch_idx,
+                        "batches_per_epoch": len(train_loader), "global_step": global_step,
+                        "train_loss": running_loss / max(1, running_batches),
+                        "epoch_progress": batch_idx / max(1, len(train_loader)),
+                    })
+                    print(f"Epoch {epoch}/{config.epochs} | batch {batch_idx}/{len(train_loader)} "
+                          f"| loss {running_loss / max(1, running_batches):.4f}", flush=True)
+                    running_loss = 0.0
+                    running_batches = 0
 
-        if val_loader:
-            if improved:
-                best_cer = val_cer
-                epochs_without_improvement = 0
+                if stop_requested or stop_file.exists():
+                    stopped_early = True
+                    if stop_file.exists():
+                        try:
+                            stop_file.unlink()
+                        except FileNotFoundError:
+                            pass
+                    print(f"\nTraining stopped at epoch {epoch}, batch {batch_idx}/{len(train_loader)}.", flush=True)
+                    checkpoint_data = {
+                        "epoch": epoch - 1,
+                        "interrupted_epoch": epoch,
+                        "interrupted_batch": batch_idx,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "model_config": {"feature_channels": config.feature_channels, "temporal_blocks": config.temporal_blocks,
+                                         "image_height": config.image_height, "image_width": config.image_width},
+                        "training_config": config.to_dict(),
+                        "vocabulary": vocabulary.to_dict(),
+                        "best_cer": best_cer,
+                        "best_loss": best_loss,
+                        "global_step": global_step,
+                        "metrics": last_record,
+                    }
+                    torch.save(checkpoint_data, output_dir / "last_model.pt")
+                    print(f"Checkpoint saved to {output_dir / 'last_model.pt'}.", flush=True)
+                    print(f"To resume training, run: python3 train.py --resume", flush=True)
+                    break
+
+            if stopped_early:
+                break
+
+            # Training epoch loss comes from the actual optimizer steps; avoid a second
+            # full pass over the train set just to compute a display metric.
+            train_loss = epoch_loss_sum / max(1, epoch_batches)
+            if val_loader:
+                val_metrics = _evaluate(model, val_loader, vocabulary, device, ctc_loss)
+                val_loss = val_metrics["val_loss"]
+                val_cer = val_metrics["val_cer"]
+                word_accuracy = val_metrics["word_accuracy"]
+                confusion_labels = val_metrics["confusion_labels"]
+                confusion_matrix = val_metrics["confusion_matrix"]
+                monitored = val_cer
+                improved = math.isfinite(val_cer) and val_cer < best_cer
             else:
-                epochs_without_improvement += 1
-        else:
-            if improved:
-                best_loss = train_loss
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
+                val_loss, val_cer, word_accuracy = float("nan"), float("nan"), float("nan")
+                confusion_labels, confusion_matrix = [], []
+                monitored = train_loss
+                improved = math.isfinite(train_loss) and train_loss < best_loss
 
+            scheduler.step()
+            duration = time.perf_counter() - epoch_start
+            record = {
+                "kind": "epoch", "epoch": epoch, "global_step": global_step,
+                "train_loss": float(train_loss), "val_loss": float(val_loss),
+                "val_cer": float(val_cer), "word_accuracy": float(word_accuracy),
+                "confusion_labels": confusion_labels, "confusion_matrix": confusion_matrix,
+                "lr": float(optimizer.param_groups[0]["lr"]), "seconds": float(duration),
+            }
+            last_record = record
+            _append_jsonl(metrics_jsonl, record)
+            print(f"Epoch {epoch}/{config.epochs} complete | train_loss={train_loss:.4f} "
+                  f"val_loss={val_loss:.4f} val_CER={val_cer:.4f} exact_accuracy={word_accuracy:.4f} "
+                  f"time={duration:.1f}s", flush=True)
+
+            if val_loader:
+                if improved:
+                    best_cer = val_cer
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+            else:
+                if improved:
+                    best_loss = train_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+            checkpoint_data = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "model_config": {"feature_channels": config.feature_channels, "temporal_blocks": config.temporal_blocks,
+                                 "image_height": config.image_height, "image_width": config.image_width},
+                "training_config": config.to_dict(),
+                "vocabulary": vocabulary.to_dict(),
+                "best_cer": best_cer,
+                "best_loss": best_loss,
+                "global_step": global_step,
+                "metrics": record,
+            }
+            if config.save_every_epoch:
+                torch.save(checkpoint_data, output_dir / f"epoch_{epoch}.pt")
+            torch.save(checkpoint_data, output_dir / "last_model.pt")
+            if improved:
+                torch.save(checkpoint_data, output_dir / "best_model.pt")
+
+            if stop_requested or stop_file.exists():
+                stopped_early = True
+                if stop_file.exists():
+                    try:
+                        stop_file.unlink()
+                    except FileNotFoundError:
+                        pass
+                print(f"\nTraining stopped after completing epoch {epoch}.", flush=True)
+                print(f"Checkpoint saved to {output_dir / 'last_model.pt'}.", flush=True)
+                print(f"To resume training, run: python3 train.py --resume", flush=True)
+                break
+
+            if config.patience > 0 and epochs_without_improvement >= config.patience:
+                print(f"Early stopping: no improvement for {config.patience} epochs.", flush=True)
+                break
+
+    except KeyboardInterrupt:
+        stopped_early = True
+        print("\nInterrupt caught. Saving checkpoint...", flush=True)
+        interrupted_epoch = epoch - 1 if 'epoch' in locals() else 0
         checkpoint_data = {
-            "epoch": epoch,
+            "epoch": interrupted_epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -254,15 +417,23 @@ def train_model(config: OCRConfig, dataset_root: str | Path = "dataset",
             "best_cer": best_cer,
             "best_loss": best_loss,
             "global_step": global_step,
-            "metrics": record,
+            "metrics": last_record,
         }
         torch.save(checkpoint_data, output_dir / "last_model.pt")
-        if improved:
-            torch.save(checkpoint_data, output_dir / "best_model.pt")
-        if config.patience > 0 and epochs_without_improvement >= config.patience:
-            print(f"Early stopping: no improvement for {config.patience} epochs.", flush=True)
-            break
+        print(f"Checkpoint saved to {output_dir / 'last_model.pt'}. To resume: python3 train.py --resume", flush=True)
+    finally:
+        if prev_int is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_int)
+            except (ValueError, AttributeError):
+                pass
+        if prev_term is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_term)
+            except (ValueError, AttributeError):
+                pass
 
     final_path = output_dir / "last_model.pt"
     return {"checkpoint": str(final_path), "best_checkpoint": str(output_dir / "best_model.pt"),
-            "vocabulary": vocabulary.to_dict(), "parameters": model.count_parameters(), "device": str(device)}
+            "vocabulary": vocabulary.to_dict(), "parameters": model.count_parameters(), "device": str(device),
+            "stopped_early": stopped_early}

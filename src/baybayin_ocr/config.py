@@ -14,15 +14,16 @@ class OCRConfig:
     batch_size: int = 32
     epochs: int = 100
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4
     grad_clip: float = 5.0
-    val_split: float = 0.30
+    val_split: float = 0.20
     num_workers: int = 0
     patience: int = 4
     seed: int = 42
     device: str = "auto"
     augment: bool = True
     log_every_n_batches: int = 10
+    save_every_epoch: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

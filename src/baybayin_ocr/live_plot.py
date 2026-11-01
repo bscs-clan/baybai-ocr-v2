@@ -94,20 +94,24 @@ def _build_plots(records, output_dir: Path, interactive: bool):
     import matplotlib.pyplot as plt
 
     glyph_coverage = _configure_fonts(matplotlib)
-    batches = [r for r in records if r.get("kind") == "batch" and r.get("train_loss") is not None]
-    epochs = [r for r in records if r.get("kind") == "epoch"]
-    train_x = [r.get("global_step", i + 1) for i, r in enumerate(batches)]
-    train_y = [r["train_loss"] for r in batches]
+    epoch_dict = {}
+    for r in records:
+        if r.get("kind") == "epoch" and "epoch" in r:
+            epoch_dict[r["epoch"]] = r
+    epochs = [epoch_dict[k] for k in sorted(epoch_dict.keys())]
+    train_loss = [(r["epoch"], r["train_loss"]) for r in epochs if r.get("train_loss") is not None]
     val_loss = [(r["epoch"], r["val_loss"]) for r in epochs if r.get("val_loss") is not None]
     quality = [(r["epoch"], r.get("val_cer"), r.get("word_accuracy")) for r in epochs
                if r.get("val_cer") is not None or r.get("word_accuracy") is not None]
     matrix_record = next((r for r in reversed(epochs) if r.get("confusion_matrix")), None)
 
     fig_loss, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
-    ax.plot(train_x, train_y, label="Training loss (batch average)", linewidth=1.2)
-    ax.set(title="Training loss", xlabel="Optimizer step", ylabel="CTC loss")
+    if train_loss:
+        ax.plot([x for x, _ in train_loss], [y for _, y in train_loss], marker="o", label="Training loss", linewidth=1.2)
+    ax.set(title="Training loss", xlabel="Epoch", ylabel="CTC loss")
     ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
+    if train_loss:
+        ax.legend(loc="best")
 
     fig_val_loss, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
     if val_loss:
@@ -202,11 +206,11 @@ def main():
     ax_matrix = fig.add_subplot(grid[:, 1])
     fig.set_size_inches(15, 12, forward=True)
     fig.canvas.manager.set_window_title("Live training graphs")
-    lines = [ax_loss.plot([], [], label="Training batch loss")[0],
+    lines = [ax_loss.plot([], [], marker="o", label="Training loss")[0],
              ax_val.plot([], [], marker="o", label="Validation loss")[0],
              ax_quality.plot([], [], marker="o", label="Validation CER (lower is better)")[0],
              ax_quality.plot([], [], marker="o", label="Exact line accuracy")[0]]
-    ax_loss.set(title="Training loss", xlabel="Optimizer step", ylabel="CTC loss")
+    ax_loss.set(title="Training loss", xlabel="Epoch", ylabel="CTC loss")
     ax_val.set(title="Validation loss", xlabel="Epoch", ylabel="CTC loss")
     ax_quality.set(title="Validation quality", xlabel="Epoch", ylabel="Score", ylim=(-0.03, 1.03))
     ax_matrix.set_title("Validation character confusion matrix")
@@ -216,16 +220,41 @@ def main():
     for ax in (ax_loss, ax_val, ax_quality):
         ax.grid(True, alpha=0.25)
         ax.legend(loc="best")
+
+    from matplotlib.widgets import Button
+    ax_stop = fig.add_axes([0.83, 0.02, 0.14, 0.038])
+    btn_stop = Button(ax_stop, "Stop Training", color="#ffdddd", hovercolor="#ffaaaa")
+    btn_stop.label.set_fontsize(9)
+    btn_stop.label.set_weight("bold")
+
+    def on_stop_click(event):
+        stop_file = output_dir / "training.stop"
+        try:
+            stop_file.write_text("stop\n", encoding="utf-8")
+            btn_stop.label.set_text("Stopping...")
+            ax_stop.set_facecolor("#eeeeee")
+            fig.canvas.draw_idle()
+            print("Stop signal sent from live graph window.", flush=True)
+        except Exception as err:
+            print(f"Failed to write stop file: {err}", flush=True)
+
+    btn_stop.on_clicked(on_stop_click)
+
     state = {"signature": None, "finished": False, "matrix_colorbar": None}
 
     def refresh():
         records = _read_records(metrics)
         batches = [r for r in records if r.get("kind") == "batch" and r.get("train_loss") is not None]
-        epochs = [r for r in records if r.get("kind") == "epoch"]
+        epoch_dict = {}
+        for r in records:
+            if r.get("kind") == "epoch" and "epoch" in r:
+                epoch_dict[r["epoch"]] = r
+        epochs = [epoch_dict[k] for k in sorted(epoch_dict.keys())]
         signature = (len(batches), len(epochs))
         if signature != state["signature"]:
             state["signature"] = signature
-            lines[0].set_data([r.get("global_step", i + 1) for i, r in enumerate(batches)], [r["train_loss"] for r in batches])
+            train_loss = [(r["epoch"], r["train_loss"]) for r in epochs if r.get("train_loss") is not None]
+            lines[0].set_data([x for x, _ in train_loss], [y for _, y in train_loss])
             lines[1].set_data([r["epoch"] for r in epochs if r.get("val_loss") is not None], [r["val_loss"] for r in epochs if r.get("val_loss") is not None])
             lines[2].set_data([r["epoch"] for r in epochs if r.get("val_cer") is not None], [r["val_cer"] for r in epochs if r.get("val_cer") is not None])
             lines[3].set_data([r["epoch"] for r in epochs if r.get("word_accuracy") is not None], [r["word_accuracy"] for r in epochs if r.get("word_accuracy") is not None])
@@ -255,6 +284,8 @@ def main():
             fig.canvas.draw()
         if done.exists() and not state["finished"]:
             state["finished"] = True
+            btn_stop.label.set_text("Finished")
+            btn_stop.color = "#e0e0e0"
             output_dir.mkdir(parents=True, exist_ok=True)
             # Export separate figures from the final metrics and leave the live
             # window open so the completed curves can still be inspected.
